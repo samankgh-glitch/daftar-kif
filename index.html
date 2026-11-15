@@ -4,6 +4,7 @@
 <meta name="theme-color" content="#2B3FA8">
 <meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="دفتر کیف"><meta name="apple-mobile-web-app-status-bar-style" content="default">
+<script src="config.js"></script>
 <link rel="manifest" href="manifest.webmanifest"><link rel="apple-touch-icon" href="apple-touch-icon.png"><link rel="icon" href="icon-192.png">
 <style>:root{color-scheme:light;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0;font:14px system-ui,sans-serif}img{max-width:100%}[hidden]{display:none!important}</style>
 <title>دفتر کیف</title>
@@ -301,6 +302,9 @@ button.stat:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
 .wdchip{font-size:16px;font-weight:700;padding:6px 14px;border-radius:99px;background:var(--accent-soft);color:var(--ink);white-space:nowrap}
 .icon-btn.eye{color:var(--ink);display:inline-flex;align-items:center;justify-content:center}
+
+.syncst{position:fixed;top:calc(10px + env(safe-area-inset-top,0px));left:12px;z-index:30;font:inherit;font-size:12px;padding:4px 10px;border-radius:999px;border:1px solid var(--line);background:var(--surface);color:var(--muted);cursor:pointer}
+.syncst.ok{color:var(--accent)}.syncst.offline,.syncst.error,.syncst.rejected{color:var(--brass);border-color:var(--brass)}
 </style>
 <div class="shell" id="app" dir="rtl" lang="fa">
   <nav class="nav" id="nav" aria-label="بخش‌های برنامه"></nav>
@@ -319,28 +323,50 @@ button.stat:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <script>
-/* Local storage layer: gives the app the same db/user/downloads API it uses in Claude, backed by IndexedDB. */
+/* Local-first storage + optional Supabase sync. Gives the app the same db/user/downloads API it has inside Claude. */
 (function(){
+  var CFG=window.DK_CLOUD||{},CLOUD=!!(CFG.url&&CFG.key),BASE=(CFG.url||'').replace(/\/+$/,'');
   var COLS=['parties','invoices','entries','cheques','items','settings','stock','deliveries','models','orders'];
-  var dbp=null,subs={},mem={};
+  var dbp=null,subs={},sess=null,prof=null,st={state:CLOUD?'idle':'local',pending:0,rejected:0,last:0};
+  function ls(k,v){try{if(v===undefined)return JSON.parse(localStorage.getItem(k));if(v===null)localStorage.removeItem(k);else localStorage.setItem(k,JSON.stringify(v))}catch(e){return null}}
+  if(CLOUD){sess=ls('dk-sess');prof=ls('dk-prof')}
+
+  /* ---------- IndexedDB ---------- */
   function open(){
     if(dbp)return dbp;
     dbp=new Promise(function(res,rej){
-      var r=indexedDB.open('daftar-kif',1);
-      r.onupgradeneeded=function(){COLS.forEach(function(c){if(!r.result.objectStoreNames.contains(c))r.result.createObjectStore(c,{keyPath:'id'})})};
+      var r=indexedDB.open('daftar-kif',2);
+      r.onupgradeneeded=function(){
+        var d=r.result;
+        COLS.forEach(function(c){if(!d.objectStoreNames.contains(c))d.createObjectStore(c,{keyPath:'id'})});
+        if(!d.objectStoreNames.contains('outbox'))d.createObjectStore('outbox',{keyPath:'n',autoIncrement:true});
+        if(!d.objectStoreNames.contains('meta'))d.createObjectStore('meta',{keyPath:'k'});
+      };
       r.onsuccess=function(){res(r.result)};
       r.onerror=function(){rej(r.error)};
     });
     return dbp;
   }
-  function all(c){return open().then(function(db){return new Promise(function(res,rej){var q=db.transaction(c,'readonly').objectStore(c).getAll();q.onsuccess=function(){res(q.result)};q.onerror=function(){rej(q.error)}})})}
+  function req(r){return new Promise(function(res,rej){r.onsuccess=function(){res(r.result)};r.onerror=function(){rej(r.error)}})}
+  function done(t){return new Promise(function(res,rej){t.oncomplete=function(){res()};t.onerror=function(){rej(t.error)};t.onabort=function(){rej(t.error||{code:'quota_exceeded'})}})}
+  function all(c){return open().then(function(d){return req(d.transaction(c,'readonly').objectStore(c).getAll())})}
+  function getMeta(k){return open().then(function(d){return req(d.transaction('meta','readonly').objectStore('meta').get(k))}).then(function(o){return o?o.v:undefined})}
+  function setMeta(k,v){return open().then(function(d){var t=d.transaction('meta','readwrite');t.objectStore('meta').put({k:k,v:v});return done(t)})}
   function snap(rows){return{docs:rows.map(function(o){return{id:o.id,exists:true,data:function(){return o}}}),metadata:{fromCache:false,hasPendingWrites:false}}}
   function notify(c){all(c).then(function(rows){(subs[c]||[]).forEach(function(f){f(snap(rows))})})}
-  function write(c,fn){return open().then(function(db){return new Promise(function(res,rej){var t=db.transaction(c,'readwrite');fn(t.objectStore(c));t.oncomplete=function(){res()};t.onerror=function(){rej(t.error)};t.onabort=function(){rej(t.error||{code:'quota_exceeded'})}})}).then(function(){notify(c)})}
+  function write(c,id,obj){
+    return open().then(function(d){
+      var t=d.transaction(CLOUD?[c,'outbox']:[c],'readwrite');
+      var o=obj?Object.assign({},obj,{id:id}):null;
+      if(o)t.objectStore(c).put(o);else t.objectStore(c).delete(id);
+      if(CLOUD)t.objectStore('outbox').add({col:c,id:id,data:o,deleted:!o,ts:Date.now()});
+      return done(t);
+    }).then(function(){notify(c);if(CLOUD){refreshPending();kick()}});
+  }
   var db={collection:function(c){return{
     doc:function(id){return{
-      set:function(o){return write(c,function(s){s.put(Object.assign({},o,{id:id}))})},
-      delete:function(){return write(c,function(s){s.delete(id)})}
+      set:function(o){return write(c,id,o)},
+      delete:function(){return write(c,id,null)}
     }},
     onSnapshot:function(next,err){
       (subs[c]=subs[c]||[]).push(next);
@@ -348,11 +374,12 @@ button.stat:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
       return function(){subs[c]=(subs[c]||[]).filter(function(f){return f!==next})};
     }
   }}};
+
+  /* ---------- downloads ---------- */
   var dl={save:function(o){
     return new Promise(function(res,rej){
       try{
-        var b=new Blob([o.data],{type:/\.html$/.test(o.filename)?'text/html;charset=utf-8':/\.csv$/.test(o.filename)?'text/csv;charset=utf-8':'application/json'});
-        if(/\.csv$/.test(o.filename))b=new Blob(['﻿',o.data],{type:'text/csv;charset=utf-8'});
+        var b=/\.csv$/.test(o.filename)?new Blob(['﻿',o.data],{type:'text/csv;charset=utf-8'}):new Blob([o.data],{type:/\.html$/.test(o.filename)?'text/html;charset=utf-8':'application/json'});
         var u=URL.createObjectURL(b),a=document.createElement('a');
         a.href=u;a.download=o.filename;document.body.appendChild(a);a.click();
         setTimeout(function(){URL.revokeObjectURL(u);a.remove()},4000);
@@ -361,10 +388,250 @@ button.stat:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     });
   }};
   try{if(navigator.storage&&navigator.storage.persist)navigator.storage.persist()}catch(e){}
+
+  /* ---------- cloud ---------- */
+  function emit(p){Object.assign(st,p||{});try{window.dispatchEvent(new CustomEvent('dk-sync',{detail:Object.assign({},st,{user:prof&&prof.username,role:prof&&prof.role})}))}catch(e){}}
+  function refreshPending(){return open().then(function(d){return req(d.transaction('outbox','readonly').objectStore('outbox').count())}).then(function(n){emit({pending:n})})}
+  function http(method,path,body,opt){
+    opt=opt||{};
+    var h={apikey:CFG.key,'Content-Type':'application/json'};
+    if(!opt.anon&&sess)h.Authorization='Bearer '+sess.access_token;
+    if(opt.prefer)h.Prefer=opt.prefer;
+    return fetch(BASE+path,{method:method,headers:h,body:body?JSON.stringify(body):undefined}).then(function(r){
+      return r.text().then(function(t){
+        var j=null;try{j=t?JSON.parse(t):null}catch(e){}
+        if(!r.ok){var e=new Error((j&&(j.msg||j.message||j.error_description||j.error))||('HTTP '+r.status));e.status=r.status;e.body=j;throw e}
+        return j;
+      });
+    });
+  }
+  function setSess(j){
+    sess={access_token:j.access_token,refresh_token:j.refresh_token,expires_at:Math.floor(Date.now()/1000)+(j.expires_in||3600),user:j.user?{id:j.user.id,email:j.user.email}:(sess&&sess.user)};
+    ls('dk-sess',sess);
+  }
+  var refreshing=null;
+  function refresh(){
+    if(refreshing)return refreshing;
+    refreshing=http('POST','/auth/v1/token?grant_type=refresh_token',{refresh_token:sess.refresh_token},{anon:true}).then(function(j){setSess(j)},function(e){
+      if(e.status===400||e.status===401||e.status===403){signOut(true)}
+      throw e;
+    }).then(function(){refreshing=null},function(e){refreshing=null;throw e});
+    return refreshing;
+  }
+  function authed(method,path,body,opt){
+    var pre=(sess&&sess.expires_at-Math.floor(Date.now()/1000)<60)?refresh():Promise.resolve();
+    return pre.then(function(){return http(method,path,body,opt)}).catch(function(e){
+      if(e.status===401&&sess){return refresh().then(function(){return http(method,path,body,opt)})}
+      throw e;
+    });
+  }
+  function loadProfile(){
+    return authed('GET','/rest/v1/profiles?select=id,username,role&id=eq.'+sess.user.id).then(function(rows){
+      if(!rows||!rows[0])throw new Error('حساب پیدا نشد.');
+      prof=rows[0];ls('dk-prof',prof);return prof;
+    });
+  }
+  function wipeLocal(){
+    return open().then(function(d){
+      var names=COLS.concat(['outbox','meta']);var t=d.transaction(names,'readwrite');
+      names.forEach(function(n){t.objectStore(n).clear()});return done(t);
+    }).then(function(){COLS.forEach(notify)});
+  }
+  function afterAuth(){
+    return loadProfile().then(function(p){
+      if(p.role!=='owner'&&p.role!=='staff'){var e=new Error(p.role==='disabled'?'این حساب غیرفعال شده است.':'این حساب هنوز توسط مدیر فعال نشده است.');signOut(true);throw e}
+      return getMeta('uid').then(function(old){
+        if(old&&old!==sess.user.id)return wipeLocal().then(function(){return setMeta('uid',sess.user.id)});
+        if(!old)return setMeta('uid',sess.user.id);
+      });
+    });
+  }
+  function toEmail(id){id=(id||'').trim();return id.indexOf('@')>=0?id:id.toLowerCase()+'@dk-staff.app'}
+  function login(id,pass){
+    return http('POST','/auth/v1/token?grant_type=password',{email:toEmail(id),password:pass},{anon:true}).then(function(j){setSess(j);return afterAuth()});
+  }
+  function signup(id,pass){
+    return http('POST','/auth/v1/signup',{email:toEmail(id),password:pass},{anon:true}).then(function(j){
+      if(!j||!j.access_token)throw new Error('ساخت حساب انجام شد ولی ورود خودکار ممکن نیست؛ «Confirm email» را در Supabase خاموش کن.');
+      setSess(j);return afterAuth();
+    });
+  }
+  function signOut(silent){
+    sess=null;prof=null;ls('dk-sess',null);ls('dk-prof',null);
+    if(!silent)location.reload();else if(window.__dkReady){setTimeout(function(){location.reload()},50)}
+  }
+  function errText(e){
+    var m=(e&&e.message)||'';
+    if(/Invalid login/i.test(m))return 'نام کاربری یا رمز درست نیست.';
+    if(/already registered|already exists/i.test(m))return 'این نام یا ایمیل قبلاً ثبت شده است.';
+    if(/Failed to fetch|NetworkError|Load failed/i.test(m)||(e&&!e.status))return 'اتصال به اینترنت یا سرور برقرار نشد.';
+    if(/Password should be/i.test(m))return 'رمز باید دست‌کم ۶ نویسه باشد.';
+    return m||'خطا';
+  }
+
+  /* ---------- sync ---------- */
+  var syncing=false,again=false,kt=0;
+  function kick(){clearTimeout(kt);kt=setTimeout(sync,700)}
+  function removeOutbox(ns){return open().then(function(d){var t=d.transaction('outbox','readwrite');ns.forEach(function(n){t.objectStore('outbox').delete(n)});return done(t)})}
+  function applyRows(rows,skip){
+    return open().then(function(d){
+      var t=d.transaction(COLS,'readwrite'),ch={};
+      rows.forEach(function(r){
+        if(COLS.indexOf(r.col)<0||skip[r.col+'/'+r.id])return;
+        if(r.deleted)t.objectStore(r.col).delete(r.id);else t.objectStore(r.col).put(Object.assign({},r.data,{id:r.id}));
+        ch[r.col]=1;
+      });
+      return done(t).then(function(){Object.keys(ch).forEach(notify)});
+    });
+  }
+  function restoreOne(col,id){
+    return authed('GET','/rest/v1/docs?select=col,id,data,deleted&col=eq.'+encodeURIComponent(col)+'&id=eq.'+encodeURIComponent(id)).then(function(rows){
+      return applyRows(rows.length?rows:[{col:col,id:id,data:{},deleted:true}],{});
+    });
+  }
+  function rowOf(i){return{col:i.col,id:i.id,data:i.data||{},deleted:!!i.deleted}}
+  function push(){
+    return all('outbox').then(function(items){
+      if(!items.length)return;
+      var batch=items.slice(0,200),last={};
+      batch.forEach(function(i){last[i.col+'/'+i.id]=i});
+      var keys=Object.keys(last),ns=batch.map(function(i){return i.n});
+      var P='/rest/v1/docs?on_conflict=col,id',O={prefer:'resolution=merge-duplicates,return=minimal'};
+      return authed('POST',P,keys.map(function(k){return rowOf(last[k])}),O).then(function(){return removeOutbox(ns)},function(e){
+        if(!(e.status>=400&&e.status<500&&e.status!==401&&e.status!==429))throw e;
+        var chain=Promise.resolve();
+        keys.forEach(function(k){chain=chain.then(function(){
+          return authed('POST',P,[rowOf(last[k])],O).catch(function(e2){
+            if(!(e2.status>=400&&e2.status<500&&e2.status!==401&&e2.status!==429))throw e2;
+            st.rejected++;return restoreOne(last[k].col,last[k].id);
+          });
+        })});
+        return chain.then(function(){return removeOutbox(ns)});
+      }).then(push);
+    });
+  }
+  function pull(){
+    return Promise.all([getMeta('cursor'),all('outbox')]).then(function(r){
+      var cur=r[0]||0,skip={};r[1].forEach(function(i){skip[i.col+'/'+i.id]=1});
+      var got=0;
+      function page(){
+        return authed('GET','/rest/v1/docs?select=col,id,data,deleted,seq&seq=gt.'+Math.max(0,cur-30)+'&order=seq.asc&limit=500').then(function(rows){
+          if(!rows.length)return;
+          got+=rows.length;
+          return applyRows(rows,skip).then(function(){
+            cur=Math.max(cur,rows[rows.length-1].seq);
+            if(rows.length>=500)return page();
+          });
+        });
+      }
+      return page().then(function(){return setMeta('cursor',cur)}).then(function(){return{cursor:cur,got:got}});
+    });
+  }
+  function seedIfNeeded(p){
+    return getMeta('seeded').then(function(s){
+      if(s)return;
+      var go=(prof&&prof.role==='owner'&&p.cursor===0);
+      var chain=Promise.resolve();
+      if(go)COLS.forEach(function(c){chain=chain.then(function(){return all(c)}).then(function(rows){
+        return open().then(function(d){var t=d.transaction('outbox','readwrite');rows.forEach(function(o){t.objectStore('outbox').add({col:c,id:o.id,data:o,deleted:false,ts:Date.now()})});return done(t)});
+      })});
+      return chain.then(function(){return setMeta('seeded',true)});
+    });
+  }
+  function sync(){
+    if(!CLOUD||!sess||!prof){return Promise.resolve()}
+    if(syncing){again=true;return Promise.resolve()}
+    if(navigator.onLine===false){emit({state:'offline'});return Promise.resolve()}
+    syncing=true;emit({state:'syncing'});
+    return push().then(pull).then(seedIfNeeded).then(function(){return push()}).then(function(){return loadProfile()}).then(function(p){
+      if(p.role!=='owner'&&p.role!=='staff'){signOut();return}
+      return refreshPending().then(function(){emit({state:st.rejected?'rejected':'ok',last:Date.now()})});
+    }).catch(function(e){
+      emit({state:(e&&e.status)?'error':'offline',error:errText(e)});
+    }).then(function(){syncing=false;if(again){again=false;kick()}});
+  }
+  var started=false;
+  function startSync(){
+    if(started||!CLOUD)return;started=true;window.__dkReady=true;
+    refreshPending();sync();
+    setInterval(function(){if(document.visibilityState!=='hidden')sync()},30000);
+    window.addEventListener('online',sync);window.addEventListener('focus',sync);
+    document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible')sync()});
+  }
+
+  /* ---------- login screen ---------- */
+  function showLogin(){
+    return new Promise(function(resolve){
+      var mode='login';
+      var w=document.createElement('div');
+      w.id='dk-login';
+      w.setAttribute('dir','rtl');
+      w.innerHTML='<style>#dk-login{position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px;background:#F3F4F8;color:#151A2D;font-family:Vazirmatn,Tahoma,sans-serif}'+
+      '@media(prefers-color-scheme:dark){#dk-login{background:#0E1220;color:#E8EAF4}#dk-login .c{background:#171C2E!important;border-color:#2A3150!important}#dk-login input{background:#0E1220!important;color:#E8EAF4!important;border-color:#2A3150!important}}'+
+      '#dk-login .c{width:100%;max-width:380px;background:#fff;border:1px solid #DADEEA;border-radius:18px;padding:22px;display:flex;flex-direction:column;gap:12px}'+
+      '#dk-login h1{margin:0;font-size:22px}#dk-login p{margin:0;font-size:13.5px;opacity:.75;line-height:1.8}'+
+      '#dk-login input{font:inherit;font-size:16px;padding:12px;border-radius:12px;border:1px solid #DADEEA;background:#fff;color:inherit;width:100%;box-sizing:border-box;direction:ltr;text-align:left}'+
+      '#dk-login button{font:inherit;font-size:16px;padding:12px;border-radius:12px;border:0;cursor:pointer}'+
+      '#dk-login .p{background:#2B3FA8;color:#fff;font-weight:700}#dk-login .l{background:none;color:#2B3FA8;font-size:13.5px;padding:4px}'+
+      '#dk-login .e{color:#B3261E;font-size:13.5px;min-height:20px}</style>'+
+      '<form class="c" id="dk-f" novalidate><h1>دفتر کیف</h1><p id="dk-m">برای ورود، نام کاربری (یا ایمیل مدیر) و رمز را بنویس.</p>'+
+      '<input id="dk-u" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="نام کاربری یا ایمیل">'+
+      '<input id="dk-p" type="password" autocomplete="current-password" placeholder="رمز">'+
+      '<div class="e" id="dk-e" role="alert"></div><button class="p" id="dk-go" type="submit">ورود</button>'+
+      '<button class="l" id="dk-t" type="button">ساخت حساب مدیر (فقط بار اول)</button></form>';
+      document.body.appendChild(w);
+      var q=function(i){return w.querySelector(i)};
+      q('#dk-t').onclick=function(){
+        mode=mode==='login'?'signup':'login';
+        q('#dk-go').textContent=mode==='login'?'ورود':'ساخت حساب مدیر';
+        q('#dk-t').textContent=mode==='login'?'ساخت حساب مدیر (فقط بار اول)':'برگشت به ورود';
+        q('#dk-m').textContent=mode==='login'?'برای ورود، نام کاربری (یا ایمیل مدیر) و رمز را بنویس.':'ایمیل مدیر (همان که در تنظیمات سرور ثبت شده) و یک رمز دست‌کم ۶ نویسه بنویس.';
+        q('#dk-e').textContent='';
+      };
+      q('#dk-f').onsubmit=function(ev){
+        ev.preventDefault();
+        var u=q('#dk-u').value,p=q('#dk-p').value,e=q('#dk-e'),b=q('#dk-go');
+        if(!u.trim()||!p){e.textContent='هر دو را بنویس.';return}
+        if(mode==='signup'&&u.indexOf('@')<0){e.textContent='برای حساب مدیر، ایمیل را بنویس.';return}
+        if(navigator.onLine===false){e.textContent='برای اولین ورود به اینترنت نیاز است.';return}
+        b.disabled=true;e.textContent='';
+        (mode==='login'?login(u,p):signup(u,p)).then(function(){w.remove();resolve()},function(er){e.textContent=errText(er);b.disabled=false});
+      };
+    });
+  }
+  function ready(){
+    if(!CLOUD)return Promise.resolve();
+    if(sess&&prof&&(prof.role==='owner'||prof.role==='staff'))return Promise.resolve();
+    return showLogin();
+  }
+
+  /* ---------- admin API for the app ---------- */
+  var cloud={
+    enabled:true,
+    me:function(){return prof?{id:sess&&sess.user.id,username:prof.username,role:prof.role}:null},
+    state:function(){return Object.assign({},st)},
+    syncNow:function(){return sync()},
+    signOut:function(){signOut(false)},
+    listUsers:function(){return authed('GET','/rest/v1/profiles?select=id,username,role,created_at&order=created_at.asc')},
+    setRole:function(id,role){return authed('PATCH','/rest/v1/profiles?id=eq.'+encodeURIComponent(id),{role:role},{prefer:'return=minimal'})},
+    createStaff:function(username,password){
+      username=(username||'').trim().toLowerCase();
+      if(!/^[a-z0-9_.-]{3,20}$/.test(username))return Promise.reject(new Error('نام کاربری باید ۳ تا ۲۰ حرف انگلیسی، عدد، نقطه یا خط‌تیره باشد.'));
+      if((password||'').length<6)return Promise.reject(new Error('رمز باید دست‌کم ۶ نویسه باشد.'));
+      return http('POST','/auth/v1/signup',{email:username+'@dk-staff.app',password:password},{anon:true}).then(function(j){
+        var id=(j&&j.user&&j.user.id)||(j&&j.id);
+        if(!id)throw new Error('ساخت کاربر انجام نشد.');
+        return cloud.setRole(id,'staff').then(function(){return id});
+      });
+    },
+    errText:errText
+  };
+
   window.claude={use:function(n){
-    if(n==='db')return open().then(function(){return db});
-    if(n==='user')return Promise.resolve({can:function(){return Promise.resolve(true)}});
+    if(n==='db')return open().then(ready).then(function(){startSync();return db});
+    if(n==='user')return Promise.resolve({can:function(){return Promise.resolve(true)},role:prof?prof.role:'owner',username:prof?prof.username:''});
     if(n==='downloads')return Promise.resolve(dl);
+    if(n==='cloud')return Promise.resolve(CLOUD?cloud:null);
     return Promise.resolve(null);
   }};
 })();
@@ -978,7 +1245,7 @@ function selOptions(selId,order){
 const dateField=(id,iso,label)=>'<div class="field"><label for="'+id+'">'+label+'</label><div class="inline"><input id="'+id+'" inputmode="numeric" autocomplete="off" value="'+jfmt(iso)+'" placeholder="۱۴۰۵/۰۱/۰۱"><button type="button" class="btn small" data-act="today" data-for="'+id+'">امروز</button></div><span class="sub wd" data-wd="'+id+'">'+(iso?weekdayFa(iso):'')+'</span></div>';
 const segRadio=(name,opts,cur)=>'<div class="seg" role="radiogroup">'+opts.map(o=>'<label><input type="radio" name="'+name+'" value="'+o[0]+'"'+(o[0]===cur?' checked':'')+'><span>'+o[1]+'</span></label>').join('')+'</div>';
 const noParty=(title)=>openSheet(title,'<p class="hint">برای این ثبت اول باید یک طرف‌حساب داشته باشی.</p><div class="actions"><button class="btn primary" data-act="new-party">+ طرف‌حساب جدید</button></div>');
-const delBtn=(a,id)=>w('<button type="button" class="btn danger" data-act="'+a+'" data-id="'+esc(id)+'">حذف</button>');
+const delBtn=(a,id)=>S.role==='staff'?'':w('<button type="button" class="btn danger" data-act="'+a+'" data-id="'+esc(id)+'">حذف</button>');
 const optList=(a,cur)=>(cur&&!a.includes(cur)?a.concat([cur]):a).map(x=>'<option'+(x===cur?' selected':'')+'>'+esc(x)+'</option>').join('');
 
 /* ---------- invoice form ---------- */
@@ -1428,8 +1695,10 @@ async function init(){
   if(cl&&cl.use){try{db=await cl.use('db')}catch(e){db=null}}
   if(!db){S.local=true;loadLocal();setBanner('ذخیرهٔ ابری در دسترس نیست؛ داده‌ها فقط روی همین مرورگر می‌مانند.');render();return}
   S.db=db;
-  try{const u=await cl.use('user');if(u&&u.can){const c=await u.can('data.write');if(c===false){S.canWrite=false;setBanner('فقط می‌توانی ببینی؛ اجازهٔ ثبت و ویرایش نداری.')}}}catch(e){}
+  try{const u=await cl.use('user');if(u&&u.role)S.role=u.role;if(u&&u.can){const c=await u.can('data.write');if(c===false){S.canWrite=false;setBanner('فقط می‌توانی ببینی؛ اجازهٔ ثبت و ویرایش نداری.')}}}catch(e){}
   try{S.dl=await cl.use('downloads')}catch(e){S.dl=null}
+  try{S.cloud=await cl.use('cloud')}catch(e){S.cloud=null}
+  setupRole();
   startTimer();
   COLS.forEach(c=>{
     db.collection(c).onSnapshot(snap=>{
@@ -2239,6 +2508,68 @@ document.addEventListener('click',e=>{
   const b=e.target.closest('[data-act="toggle-hide"]');if(!b)return;
   ui.hideNum=!ui.hideNum;try{localStorage.setItem('dk-hide',ui.hideNum?'1':'0')}catch(x){}
   render();
+});
+
+/* ---------- roles, sync status, users (cloud mode only) ---------- */
+(()=>{let _cw=true;Object.defineProperty(S,'canWrite',{get(){return _cw&&(S.role!=='staff'||['daily','stock'].includes(ui.tab))},set(v){_cw=v},configurable:true})})();
+const ROLEN={owner:'مدیر',staff:'کاربر',pending:'در انتظار فعال‌سازی',disabled:'غیرفعال'};
+const SYNCN={ok:'هماهنگ',syncing:'در حال هماهنگی…',offline:'آفلاین',error:'خطای هماهنگی',rejected:'برخی ثبت‌ها پذیرفته نشد',idle:'…'};
+function setupRole(){
+  if(S.role==='staff'){
+    const ok=['home','daily','stock','weekly','cost'];
+    const keep=TABS.filter(t=>ok.includes(t[0])).map(t=>{const c=t.slice();c[3]=0;return c});
+    TABS.splice(0,TABS.length,...keep);
+  }
+  if(S.cloud&&S.role==='owner'&&!TABS.some(t=>t[0]==='users'))TABS.push(['users','کاربران','کاربران و دسترسی',1,'<circle cx="9" cy="8" r="3.2"/><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6"/><path d="M17 8v6M14 11h6"/>']);
+  TABIDS.splice(0,TABIDS.length,...TABS.map(t=>t[0]));
+  buildNav();route();
+  if(S.cloud){
+    if(!$('#syncst')){const b=document.createElement('button');b.id='syncst';b.type='button';b.className='syncst';b.dataset.act='account';document.body.appendChild(b)}
+    const paint=d=>{const b=$('#syncst');if(!b)return;const s=d||S.cloud.state();b.className='syncst '+(s.state||'idle');b.textContent=(SYNCN[s.state]||'')+(s.pending?' · '+faD(s.pending)+' در صف':'')};
+    window.addEventListener('dk-sync',e=>paint(e.detail));paint();
+  }
+}
+function openAccount(){
+  if(!S.cloud)return;
+  const m=S.cloud.me()||{},s=S.cloud.state();
+  openSheet('حساب من',
+    '<p class="hint">کاربر: <b>'+esc(m.username||'')+'</b> · '+(ROLEN[m.role]||'')+'</p>'+
+    '<p class="hint">وضعیت: '+(SYNCN[s.state]||'')+(s.pending?' — '+faD(s.pending)+' ثبت در صف ارسال':'')+(s.last?' — آخرین هماهنگی '+faD(new Date(s.last).toLocaleTimeString('fa-IR',{hour:'2-digit',minute:'2-digit'})):'')+'</p>'+
+    (s.error?'<p class="hint">'+esc(s.error)+'</p>':'')+
+    '<div class="actions"><button class="btn primary" data-act="sync-now">هماهنگ‌سازی الان</button>'+(m.role==='owner'?'<a class="btn" href="#users" data-act="close">کاربران</a>':'')+'<button class="btn danger" data-act="sign-out">خروج</button></div>');
+}
+VIEWS.users={html(){
+  if(S.role!=='owner')return emptyBox('دسترسی ندارید');
+  setTimeout(loadUsers,0);
+  return'<div class="page-head"><h1>کاربران و دسترسی</h1></div><p class="hint">کاربر عادی فقط دفتر روزانه و دفتر انبار را می‌بیند و ثبت می‌کند و خانه، آمار هفتگی و برآورد قیمت را فقط می‌بیند. حذف و بقیهٔ بخش‌ها را ندارد.</p>'+
+  '<section class="card"><h2>کاربر جدید</h2><div class="row2 wrap"><div class="field"><label for="u-name">نام کاربری (حرف انگلیسی/عدد)</label><input id="u-name" dir="ltr" autocapitalize="none" autocomplete="off"></div><div class="field"><label for="u-pass">رمز (دست‌کم ۶ نویسه)</label><input id="u-pass" dir="ltr" autocomplete="off"></div></div>'+
+  '<div class="actions"><button class="btn primary" data-act="user-add">ساخت کاربر</button></div></section>'+
+  '<section class="card"><h2>کاربران</h2><div id="ulist" class="list plain"><div class="skel"></div></div></section>';
+}};
+async function loadUsers(){
+  const el=$('#ulist');if(!el||!S.cloud)return;
+  try{
+    const a=await S.cloud.listUsers(),me=(S.cloud.me()||{}).id;
+    el.innerHTML=a.map(p=>'<div class="rrow"><span class="r-main"><b>'+esc(p.username)+'</b><span class="sub">'+chip(p.role==='owner'?'acc':p.role==='staff'?'good':'neutral',ROLEN[p.role]||p.role)+'</span></span>'+
+      (p.id===me?'':'<span>'+(p.role==='staff'?'<button class="btn small danger" data-act="user-role" data-id="'+esc(p.id)+'" data-r="disabled">غیرفعال</button>':'<button class="btn small" data-act="user-role" data-id="'+esc(p.id)+'" data-r="staff">فعال کن</button>')+'</span>')+'</div>').join('')||emptyBox('کاربری نیست');
+  }catch(e){el.innerHTML='<p class="hint">'+esc(S.cloud.errText(e))+'</p>'}
+}
+document.addEventListener('click',async e=>{
+  const b=e.target.closest('[data-act]');if(!b||!S.cloud)return;
+  const a=b.dataset.act;
+  if(a==='account'){openAccount();return}
+  if(a==='sync-now'){S.cloud.syncNow();toast('هماهنگ‌سازی شروع شد');closeSheet();return}
+  if(a==='sign-out'){S.cloud.signOut();return}
+  if(a==='user-add'){
+    b.disabled=true;
+    try{await S.cloud.createStaff($('#u-name').value,$('#u-pass').value);toast('کاربر ساخته شد');$('#u-name').value='';$('#u-pass').value='';loadUsers()}
+    catch(err){toast(S.cloud.errText(err))}
+    b.disabled=false;return;
+  }
+  if(a==='user-role'){
+    try{await S.cloud.setRole(b.dataset.id,b.dataset.r);toast('انجام شد');loadUsers()}catch(err){toast(S.cloud.errText(err))}
+    return;
+  }
 });
 init();
 
